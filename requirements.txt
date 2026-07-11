@@ -1,5 +1,6 @@
-python-dotenv
-openai
-pymupdf
-azure-search-documents
-streamlit
+Flask==3.0.3
+gunicorn==22.0.0
+PyMuPDF==1.24.9
+azure-search-documents==11.5.1
+azure-core==1.30.2
+requests==2.32.3
