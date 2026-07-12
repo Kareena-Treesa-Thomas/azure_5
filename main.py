@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import uuid
 import requests
@@ -136,9 +138,15 @@ def ask():
     if not question:
         return jsonify({"error": "Question is required."}), 400
 
-    results = list(search_client.search(search_text=question, top=TOP_K, include_total_count=True))
+    results = list(search_client.search(
+        search_text=question,
+        top=TOP_K,
+        include_total_count=True,
+        search_mode="any",
+        query_type="simple",
+    ))
     if not results:
-        return jsonify({"error": "No indexed documents yet. Upload PDFs first."}), 400
+        return jsonify({"error": "No results matched your question. Try rephrasing with more specific terms from the documents."}), 400
 
     top_context = results[:3]
     answer = call_azure_openai(question, top_context)
