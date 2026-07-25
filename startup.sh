@@ -1,1 +1,1 @@
-gunicorn --bind 0.0.0.0:8000 --timeout 180 main:app
+gunicorn --timeout 600 --workers 2 main:app
