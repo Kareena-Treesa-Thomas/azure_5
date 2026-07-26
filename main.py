@@ -104,65 +104,73 @@ def home():
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    ensure_index()
-    clear_index()
+    try:
+        ensure_index()
+        clear_index()
 
-    docs_to_index = []
-    uploaded_names = {}
-    for slot in ("doc1", "doc2"):
-        file = request.files.get(slot)
-        if not file or file.filename == "":
-            continue
-        text = extract_text(file.stream)
-        chunks = chunk_text(text)
-        uploaded_names[slot] = file.filename
-        for idx, chunk in enumerate(chunks):
-            docs_to_index.append({
-                "id": str(uuid.uuid4()),
-                "content": chunk,
-                "doc_slot": slot,
-                "doc_name": file.filename,
-                "chunk_index": idx,
-            })
+        docs_to_index = []
+        uploaded_names = {}
+        for slot in ("doc1", "doc2"):
+            file = request.files.get(slot)
+            if not file or file.filename == "":
+                continue
+            text = extract_text(file.stream)
+            chunks = chunk_text(text)
+            uploaded_names[slot] = file.filename
+            for idx, chunk in enumerate(chunks):
+                docs_to_index.append({
+                    "id": str(uuid.uuid4()),
+                    "content": chunk,
+                    "doc_slot": slot,
+                    "doc_name": file.filename,
+                    "chunk_index": idx,
+                })
 
-    if not docs_to_index:
-        return jsonify({"error": "Upload at least one PDF."}), 400
+        if not docs_to_index:
+            return jsonify({"error": "Upload at least one PDF."}), 400
 
-    search_client.upload_documents(docs_to_index)
-    return jsonify({"status": "indexed", "documents": uploaded_names, "chunks": len(docs_to_index)})
+        search_client.upload_documents(docs_to_index)
+        return jsonify({"status": "indexed", "documents": uploaded_names, "chunks": len(docs_to_index)})
+    except Exception as e:
+        app.logger.exception("Upload failed")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    question = request.json.get("question", "").strip()
-    if not question:
-        return jsonify({"error": "Question is required."}), 400
+    try:
+        question = request.json.get("question", "").strip()
+        if not question:
+            return jsonify({"error": "Question is required."}), 400
 
-    results = list(search_client.search(
-        search_text=question,
-        top=TOP_K,
-        include_total_count=True,
-        search_mode="any",
-        query_type="simple",
-    ))
-    if not results:
-        return jsonify({"error": "No results matched your question. Try rephrasing with more specific terms from the documents."}), 400
+        results = list(search_client.search(
+            search_text=question,
+            top=TOP_K,
+            include_total_count=True,
+            search_mode="any",
+            query_type="simple",
+        ))
+        if not results:
+            return jsonify({"error": "No results matched your question. Try rephrasing with more specific terms from the documents."}), 400
 
-    top_context = results[:3]
-    answer = call_azure_openai(question, top_context)
+        top_context = results[:3]
+        answer = call_azure_openai(question, top_context)
 
-    # Tally which document contributed more to the top matches -> the "winner"
-    tally = {}
-    for r in top_context:
-        tally[r["doc_name"]] = tally.get(r["doc_name"], 0) + 1
-    winner = max(tally, key=tally.get)
+        # Tally which document contributed more to the top matches -> the "winner"
+        tally = {}
+        for r in top_context:
+            tally[r["doc_name"]] = tally.get(r["doc_name"], 0) + 1
+        winner = max(tally, key=tally.get)
 
-    sources = [
-        {"doc_name": r["doc_name"], "doc_slot": r["doc_slot"], "score": round(r["@search.score"], 2)}
-        for r in top_context
-    ]
+        sources = [
+            {"doc_name": r["doc_name"], "doc_slot": r["doc_slot"], "score": round(r["@search.score"], 2)}
+            for r in top_context
+        ]
 
-    return jsonify({"answer": answer, "winner": winner, "sources": sources})
+        return jsonify({"answer": answer, "winner": winner, "sources": sources})
+    except Exception as e:
+        app.logger.exception("Ask failed")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
