@@ -1,10 +1,13 @@
 from dotenv import load_dotenv
+
 load_dotenv()
+
 import os
 import uuid
 import requests
 import fitz  # PyMuPDF
 from flask import Flask, request, jsonify, render_template
+from werkzeug.exceptions import HTTPException
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
@@ -13,12 +16,12 @@ from azure.search.documents.indexes.models import (
 )
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB total upload limit
 
 # ---- Config (read from environment / .env via App Service settings) ----
 SEARCH_ENDPOINT = os.environ["AZURE_SEARCH_ENDPOINT"]
 SEARCH_KEY = os.environ["AZURE_SEARCH_KEY"]
 SEARCH_INDEX = os.environ.get("AZURE_SEARCH_INDEX", "documents")
-
 OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"].rstrip("/")
 OPENAI_KEY = os.environ["AZURE_OPENAI_KEY"]
 OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
@@ -26,16 +29,32 @@ OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-prev
 
 CHUNK_SIZE = 1000
 TOP_K = 6
+UPLOAD_BATCH_SIZE = 500
 
 index_client = SearchIndexClient(SEARCH_ENDPOINT, AzureKeyCredential(SEARCH_KEY))
 search_client = SearchClient(SEARCH_ENDPOINT, SEARCH_INDEX, AzureKeyCredential(SEARCH_KEY))
 
 
+# ---- Errors: every failure returns JSON, never an HTML error page ----
+@app.errorhandler(HTTPException)
+def handle_http_error(e):
+    # Covers 404, 405, 413 (file too large), etc.
+    return jsonify({"error": e.description}), e.code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    app.logger.exception("Unhandled error")
+    return jsonify({"error": str(e)}), 500
+
+
+# ---- Index ----
 def ensure_index():
-    """Create the search index once, if it doesn't already exist."""
-    existing = [i.name for i in index_client.list_indexes()]
-    if SEARCH_INDEX in existing:
-        return
+    """Create the index, or add any missing fields to an existing one.
+
+    create_or_update_index never skips the schema check, so an old index
+    without doc_slot gets fixed instead of causing upload errors.
+    """
     fields = [
         SimpleField(name="id", type=SearchFieldDataType.String, key=True),
         SearchableField(name="content", type=SearchFieldDataType.String),
@@ -43,14 +62,29 @@ def ensure_index():
         SimpleField(name="doc_name", type=SearchFieldDataType.String, filterable=True, facetable=True),
         SimpleField(name="chunk_index", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
     ]
-    index_client.create_index(SearchIndex(name=SEARCH_INDEX, fields=fields))
+    index_client.create_or_update_index(SearchIndex(name=SEARCH_INDEX, fields=fields))
 
 
+def clear_index():
+    """Wipe all docs so each new pair of uploads starts fresh.
+
+    Loops until the index is empty, so it works past the 1000-result limit.
+    """
+    for _ in range(50):  # safety cap
+        results = search_client.search(search_text="*", select=["id"], top=1000)
+        ids = [{"id": r["id"]} for r in results]
+        if not ids:
+            return
+        search_client.delete_documents(ids)
+
+
+# ---- PDF helpers ----
 def extract_text(file_stream) -> str:
     doc = fitz.open(stream=file_stream.read(), filetype="pdf")
-    text = "\n".join(page.get_text() for page in doc)
-    doc.close()
-    return text
+    try:
+        return "\n".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
 
 
 def chunk_text(text: str, size: int = CHUNK_SIZE):
@@ -58,15 +92,8 @@ def chunk_text(text: str, size: int = CHUNK_SIZE):
     return [text[i:i + size] for i in range(0, len(text), size) if text[i:i + size].strip()]
 
 
-def clear_index():
-    """Wipe existing docs so each new pair of uploads starts fresh (demo-friendly)."""
-    results = search_client.search(search_text="*", select=["id"], top=1000)
-    ids = [{"id": r["id"]} for r in results]
-    if ids:
-        search_client.delete_documents(ids)
-
-
-def call_azure_openai(question: str, context_blocks: list[dict]) -> str:
+# ---- Azure OpenAI ----
+def call_azure_openai(question: str, context_blocks: list) -> str:
     context = "\n\n".join(
         f"[Source: {c['doc_name']}]\n{c['content']}" for c in context_blocks
     )
@@ -97,6 +124,7 @@ def call_azure_openai(question: str, context_blocks: list[dict]) -> str:
     return resp.json()["choices"][0]["message"]["content"]
 
 
+# ---- Routes ----
 @app.route("/")
 def home():
     return render_template("index.html")
@@ -110,12 +138,23 @@ def upload():
 
         docs_to_index = []
         uploaded_names = {}
+
         for slot in ("doc1", "doc2"):
             file = request.files.get(slot)
             if not file or file.filename == "":
                 continue
-            text = extract_text(file.stream)
+
+            try:
+                text = extract_text(file.stream)
+            except Exception:
+                return jsonify({"error": f"'{file.filename}' could not be read as a PDF."}), 400
+
             chunks = chunk_text(text)
+            if not chunks:
+                return jsonify({
+                    "error": f"'{file.filename}' has no readable text (it may be a scanned PDF)."
+                }), 400
+
             uploaded_names[slot] = file.filename
             for idx, chunk in enumerate(chunks):
                 docs_to_index.append({
@@ -129,8 +168,22 @@ def upload():
         if not docs_to_index:
             return jsonify({"error": "Upload at least one PDF."}), 400
 
-        search_client.upload_documents(docs_to_index)
-        return jsonify({"status": "indexed", "documents": uploaded_names, "chunks": len(docs_to_index)})
+        # Upload in batches and check each document actually got accepted.
+        failed = []
+        for i in range(0, len(docs_to_index), UPLOAD_BATCH_SIZE):
+            results = search_client.upload_documents(docs_to_index[i:i + UPLOAD_BATCH_SIZE])
+            failed.extend(r.error_message for r in results if not r.succeeded)
+
+        if failed:
+            return jsonify({
+                "error": f"{len(failed)} chunk(s) failed to index. First error: {failed[0]}"
+            }), 500
+
+        return jsonify({
+            "status": "indexed",
+            "documents": uploaded_names,
+            "chunks": len(docs_to_index),
+        })
     except Exception as e:
         app.logger.exception("Upload failed")
         return jsonify({"error": str(e)}), 500
@@ -139,7 +192,8 @@ def upload():
 @app.route("/ask", methods=["POST"])
 def ask():
     try:
-        question = request.json.get("question", "").strip()
+        payload = request.get_json(silent=True) or {}
+        question = (payload.get("question") or "").strip()
         if not question:
             return jsonify({"error": "Question is required."}), 400
 
@@ -151,7 +205,9 @@ def ask():
             query_type="simple",
         ))
         if not results:
-            return jsonify({"error": "No results matched your question. Try rephrasing with more specific terms from the documents."}), 400
+            return jsonify({
+                "error": "No results matched your question. Try rephrasing with more specific terms from the documents."
+            }), 400
 
         top_context = results[:3]
         answer = call_azure_openai(question, top_context)
@@ -166,7 +222,6 @@ def ask():
             {"doc_name": r["doc_name"], "doc_slot": r["doc_slot"], "score": round(r["@search.score"], 2)}
             for r in top_context
         ]
-
         return jsonify({"answer": answer, "winner": winner, "sources": sources})
     except Exception as e:
         app.logger.exception("Ask failed")
