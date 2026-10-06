@@ -610,6 +610,16 @@
   fileA.addEventListener('change', () => { if (fileA.files[0]) nameA.textContent = fileA.files[0].name; });
   fileB.addEventListener('change', () => { if (fileB.files[0]) nameB.textContent = fileB.files[0].name; });
 
+  async function readJsonResponse(res) {
+    const text = (await res.text()).trim();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error('The server returned an invalid JSON response.');
+    }
+  }
+
   indexBtn.addEventListener('click', async () => {
     if (!fileA.files[0] && !fileB.files[0]) { indexStatus.textContent = 'Choose at least one PDF first.'; return; }
     indexBtn.disabled = true;
@@ -619,10 +629,10 @@
     if (fileB.files[0]) formData.append('doc2', fileB.files[0]);
     try {
       const res = await fetch('/upload', { method: 'POST', body: formData });
-      const data = await res.json();
+      const data = await readJsonResponse(res);
       if (!res.ok) throw new Error(data.error || 'Upload failed');
-      docNameA = data.documents.doc1 || null;
-      docNameB = data.documents.doc2 || null;
+      docNameA = data.documents?.doc1 || null;
+      docNameB = data.documents?.doc2 || null;
       indexStatus.textContent = `Indexed ${data.chunks} chunks. Ready to ask.`;
       setStep({ 1: 'done', 2: 'done', 3: 'active', 4: null });
     } catch (err) {
@@ -648,7 +658,7 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question }),
       });
-      const data = await res.json();
+      const data = await readJsonResponse(res);
       if (!res.ok) throw new Error(data.error || 'Something went wrong.');
 
       const isA = data.winner === docNameA;
