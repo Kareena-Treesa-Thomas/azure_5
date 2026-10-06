@@ -121,7 +121,26 @@ def call_azure_openai(question: str, context_blocks: list) -> str:
         timeout=60,
     )
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    response_text = resp.text.strip()
+    if not response_text:
+        raise RuntimeError(
+            f"Azure OpenAI returned an empty response (HTTP {resp.status_code})."
+        )
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        content_type = resp.headers.get("Content-Type", "unknown")
+        raise RuntimeError(
+            "Azure OpenAI returned a non-JSON response "
+            f"(HTTP {resp.status_code}, Content-Type: {content_type})."
+        ) from exc
+
+    try:
+        return payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            "Azure OpenAI returned JSON without a chat completion message."
+        ) from exc
 
 
 # ---- Routes ----
@@ -219,12 +238,16 @@ def ask():
         winner = max(tally, key=tally.get)
 
         sources = [
-            {"doc_name": r["doc_name"], "doc_slot": r["doc_slot"], "score": round(r["@search.score"], 2)}
+            {"doc_name": r["doc_name"], "doc_slot": r.get("doc_slot", "unknown"), "score": round(r["@search.score"], 2)}
             for r in top_context
         ]
         return jsonify({"answer": answer, "winner": winner, "sources": sources})
     except Exception as e:
         app.logger.exception("Ask failed")
+        if "doc_slot" in str(e):
+            return jsonify({
+                "error": "The Azure AI Search index is still using the old schema. Delete and recreate the 'documents' index so it includes doc_slot."
+            }), 500
         return jsonify({"error": str(e)}), 500
 
 
