@@ -9,6 +9,7 @@ import fitz  # PyMuPDF
 from flask import Flask, request, jsonify, render_template
 from werkzeug.exceptions import HTTPException
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ResourceNotFoundError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -50,19 +51,25 @@ def handle_unexpected_error(e):
 
 # ---- Index ----
 def ensure_index():
-    """Create the index, or add any missing fields to an existing one.
-
-    create_or_update_index never skips the schema check, so an old index
-    without doc_slot gets fixed instead of causing upload errors.
-    """
-    fields = [
+    """Create the index or add required fields without deleting old fields."""
+    required_fields = [
         SimpleField(name="id", type=SearchFieldDataType.String, key=True),
         SearchableField(name="content", type=SearchFieldDataType.String),
         SimpleField(name="doc_slot", type=SearchFieldDataType.String, filterable=True, facetable=True),
         SimpleField(name="doc_name", type=SearchFieldDataType.String, filterable=True, facetable=True),
         SimpleField(name="chunk_index", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
     ]
-    index_client.create_or_update_index(SearchIndex(name=SEARCH_INDEX, fields=fields))
+    try:
+        index = index_client.get_index(SEARCH_INDEX)
+    except ResourceNotFoundError:
+        index = SearchIndex(name=SEARCH_INDEX, fields=required_fields)
+    else:
+        existing_names = {field.name for field in index.fields}
+        index.fields = list(index.fields) + [
+            field for field in required_fields if field.name not in existing_names
+        ]
+
+    index_client.create_or_update_index(index)
 
 
 def clear_index():
