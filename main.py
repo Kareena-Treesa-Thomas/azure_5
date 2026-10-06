@@ -20,13 +20,13 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB total upload limit
 
 # ---- Config (read from environment / .env via App Service settings) ----
-SEARCH_ENDPOINT = os.environ["AZURE_SEARCH_ENDPOINT"]
-SEARCH_KEY = os.environ["AZURE_SEARCH_KEY"]
+SEARCH_ENDPOINT = os.environ["AZURE_SEARCH_ENDPOINT"].strip().rstrip("/")
+SEARCH_KEY = os.environ["AZURE_SEARCH_KEY"].strip()
 SEARCH_INDEX = os.environ.get("AZURE_SEARCH_INDEX", "documents")
-OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"].rstrip("/")
-OPENAI_KEY = os.environ["AZURE_OPENAI_KEY"]
-OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
-OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"].strip().rstrip("/")
+OPENAI_KEY = os.environ["AZURE_OPENAI_KEY"].strip()
+OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"].strip()
+OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview").strip()
 
 CHUNK_SIZE = 1000
 TOP_K = 6
@@ -127,6 +127,17 @@ def call_azure_openai(question: str, context_blocks: list) -> str:
         },
         timeout=60,
     )
+    if resp.status_code == 401:
+        try:
+            azure_error = resp.json().get("error", {})
+            detail = azure_error.get("message") or azure_error.get("code")
+        except ValueError:
+            detail = None
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            "Azure OpenAI rejected the configured credential or endpoint "
+            f"(HTTP 401){suffix}."
+        )
     resp.raise_for_status()
     response_text = resp.text.strip()
     if not response_text:
